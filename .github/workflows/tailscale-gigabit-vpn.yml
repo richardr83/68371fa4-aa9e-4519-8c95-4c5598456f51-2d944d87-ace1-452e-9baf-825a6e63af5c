@@ -252,8 +252,14 @@ jobs:
             exit 1
           fi
 
+          # Detect this workflow's own filename (e.g. "owner/repo/.github/workflows/x.yml@refs/heads/main")
+          workflow_ref="${{ github.workflow_ref }}"
+          workflow_file="${workflow_ref%%@*}"
+          workflow_file="${workflow_file##*/}"
+          workflow_file="${workflow_file:-tailscale-gigabit-vpn.yml}"
+
           next=$((loops - 1))
-          echo "🔁 Dispatching next iteration: $next remaining..."
+          echo "🔁 Dispatching next iteration of $workflow_file: $next remaining..."
 
           payload=$(jq -n \
             --arg ref "${{ github.ref_name }}" \
@@ -266,7 +272,7 @@ jobs:
             }')
 
           response=$(curl -s -w "\n%{http_code}" -X POST \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/tailscale-gigabit-vpn.yml/dispatches" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$workflow_file/dispatches" \
             -H "Authorization: Bearer $token" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -281,7 +287,7 @@ jobs:
           else
             echo "⚠️ Chain dispatch returned HTTP status $http_code:"
             echo "$body"
-            echo "💡 Tip: Make sure .github/workflows/tailscale-gigabit-vpn.yml is committed and pushed to your GitHub repository's default branch."
+            echo "💡 Tip: Make sure .github/workflows/$workflow_file is committed and pushed to your GitHub repository's default branch."
           fi
 
       # ───────────────────────────────────────────────
