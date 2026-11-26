@@ -1,0 +1,545 @@
+name: 🎬 ytdl-web Server • Hybrid Cloudflare Tunnel + Windows RDP (Auto-Loop) — by Redwanul Haque
+# 📄 Suggested filename: .github/workflows/ytdl-web-hybrid-tunnel.yml
+#    (Any filename works — the chain-rotation step detects its own file automatically.)
+#
+# 🔀 Hybrid Tunnel Mode:
+#    • CLOUDFLARE_TUNNEL_TOKEN_YTDL + YTDL_WEB_URL secrets set → 🔒 permanent named tunnel (fixed domain)
+#    • Secrets not set (or named tunnel fails)                  → 🔁 free random trycloudflare.com URL
+#
+# 🔑 Required secrets : GH_PAT, TAILSCALE_AUTH_KEY
+# 🧩 Optional secrets : CLOUDFLARE_TUNNEL_TOKEN_YTDL, YTDL_WEB_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# ♻️ Each run lasts ~5h 40m, then re-dispatches itself (default 4 loops).
+
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ytdl-web-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate Required Secrets
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate Required Secrets
+        id: validate
+        run: |
+          $token = "${{ secrets.GH_PAT }}"
+          $tsKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+
+          if (-not $token -or $token.Length -lt 10) {
+              Write-Error "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+              exit 1
+          }
+          if (-not $tsKey -or $tsKey.Length -lt 5) {
+              Write-Error "❌ TAILSCALE_AUTH_KEY secret is not set! Go to repo Settings > Secrets > Actions and add TAILSCALE_AUTH_KEY."
+              exit 1
+          }
+          Write-Host "✅ GH_PAT and TAILSCALE_AUTH_KEY secrets are configured."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Setup User & Folders
+      # ───────────────────────────────────────────────
+      - name: 👤 Create User & Folders
+        id: user-setup
+        run: |
+          # RDP credentials
+          $u = "SOURAV"
+          $p = "Redwanul@#1"
+
+          # Save for later steps
+          "RDP_USER=$u" | Out-File -Append $env:GITHUB_ENV
+          "RDP_PASS=$p" | Out-File -Append $env:GITHUB_ENV
+
+          # 📁 Pre-create writable folders on Temp Storage (D:\<username>\...)
+          $folders = @(
+              "Desktop",
+              "Documents",
+              "Downloads",
+              "Pictures",
+              "Videos",
+              "Music",
+              "Apps",
+              "Audios",
+              "Projects",
+              "Temp"
+          )
+          foreach ($name in $folders) {
+              $f = Join-Path "D:\$u" $name
+              if (-Not (Test-Path -Path $f)) {
+                  New-Item -Path $f -ItemType Directory -Force | Out-Null
+                  Write-Host "  📂 Created: $f"
+              }
+          }
+
+          # Create local user
+          $securePass = ConvertTo-SecureString $p -AsPlainText -Force
+          try {
+              if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $u -Password $securePass
+                  Enable-LocalUser -Name $u
+                  Write-Host "✅ User '$u' updated."
+              } else {
+                  New-LocalUser -Name $u -Password $securePass -PasswordNeverExpires -AccountNeverExpires | Out-Null
+                  Write-Host "✅ User '$u' created."
+              }
+          } catch {
+              Write-Error "❌ User creation failed: $_"
+              exit 1
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+          Write-Host "✅ User '$u' added to Administrators & Remote Desktop Users."
+
+          # Create Desktop shortcuts so user sees storage & ytdl-web on RDP login
+          $userDesktop = "C:\Users\$u\Desktop"
+          if (-not (Test-Path $userDesktop)) {
+              New-Item -Path $userDesktop -ItemType Directory -Force | Out-Null
+          }
+          $wscript = New-Object -ComObject WScript.Shell
+          $shortcutD = $wscript.CreateShortcut("$userDesktop\Temp Storage (D Drive).lnk")
+          $shortcutD.TargetPath = "D:\$u"
+          $shortcutD.Save()
+
+          $shortcutApp = $wscript.CreateShortcut("$userDesktop\ytdl-web Folder.lnk")
+          $shortcutApp.TargetPath = "C:\ytdl-web"
+          $shortcutApp.Save()
+
+      # ───────────────────────────────────────────────
+      # Step 3: Configure RDP
+      # ───────────────────────────────────────────────
+      - name: ⚙️ Configure RDP & Display
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Disable NLA (Network Level Authentication) for easier access
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "SecurityLayer" -Value 0 -Force
+
+          # Set max color depth (32-bit)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "ColorDepth" -Value 4 -Force
+
+          # Allow multiple RDP sessions per user
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fSingleSessionPerUser" -Value 0 -Force
+
+          # Configure screen resolution (1920x1080)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Video\{*}\0000' `
+              -Name "DefaultSettings.XResolution" -Value 1920 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Video\{*}\0000' `
+              -Name "DefaultSettings.YResolution" -Value 1080 -ErrorAction SilentlyContinue
+
+          # Firewall: clean up old rule, add new one
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+              dir=in action=allow protocol=TCP localport=3389 | Out-Null
+
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+
+          # Prevent auto-lock & screen timeout
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+
+          Write-Host "✅ RDP configured (1920x1080, 32-bit color, no NLA, no screen timeout)."
+
+      # ───────────────────────────────────────────────
+      # Step 4: Install Tailscale
+      # ───────────────────────────────────────────────
+      - name: 🌐 Install & Connect Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.98.4-amd64.msi"
+
+          Write-Host "⬇️ Downloading Tailscale from $tsUrl..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\ts.msi" -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\ts.msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\ts.msi" -Force
+
+          Write-Host "✅ Tailscale installed."
+
+          # Connect to Tailscale network
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+              --hostname=gh-runner-ytdlweb-${{ github.run_number }} `
+              --accept-routes
+
+          # Wait for Tailscale IP with retry
+          $tsIP = $null; $r = 0
+          while (-not $tsIP -and $r -lt 20) {
+              $rawIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($rawIp) {
+                  $tsIP = (($rawIp | Out-String).Trim() -split "`r?`n")[0].Trim()
+              }
+              if (-not $tsIP) { Start-Sleep -Seconds 3; $r++ }
+          }
+
+          if (-not $tsIP) {
+              Write-Error "❌ Tailscale failed to obtain IP after $r retries."
+              exit 1
+          }
+
+          # Save IP for later steps
+          "TS_IP=$tsIP" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $tsIP"
+
+      # ───────────────────────────────────────────────
+      # Step 5: Setup ytdl-web & Cloudflare Tunnel (Hybrid)
+      # ───────────────────────────────────────────────
+      # 🔀 HYBRID MODE:
+      #   • If CLOUDFLARE_TUNNEL_TOKEN_YTDL + YTDL_WEB_URL secrets are set
+      #     → uses your PERMANENT named tunnel (fixed domain every run)
+      #   • Otherwise → spins up a free random trycloudflare.com quick tunnel
+      #     on localhost:8080 (no Cloudflare account needed)
+      # ───────────────────────────────────────────────
+      - name: 🚀 Setup ytdl-web & Cloudflare Tunnel (Hybrid)
+        id: ytdlweb-cf
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN_YTDL: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_YTDL }}
+          YTDL_WEB_URL: ${{ secrets.YTDL_WEB_URL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # ─────────────────────────────────────────────────────────────────
+          # Decide mode: permanent named tunnel vs. free quick tunnel
+          # ─────────────────────────────────────────────────────────────────
+          $usePermanent = (-not [string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN_YTDL)) -and
+                          (-not [string]::IsNullOrWhiteSpace($env:YTDL_WEB_URL))
+
+          $cfUrlResult = $null
+
+          if ($usePermanent) {
+              Write-Host "🔒 CLOUDFLARE_TUNNEL_TOKEN_YTDL & YTDL_WEB_URL are set."
+              Write-Host "🌐 Mode: PERMANENT Named Cloudflare Tunnel"
+              try {
+                  $permanentUri = [Uri]$env:YTDL_WEB_URL
+              } catch {
+                  throw "YTDL_WEB_URL must be a valid HTTPS URL. Got: $($env:YTDL_WEB_URL)"
+              }
+              if ($permanentUri.Scheme -ne "https" -or -not $permanentUri.Host) {
+                  throw "YTDL_WEB_URL must be a valid HTTPS URL. Got: $($env:YTDL_WEB_URL)"
+              }
+              $cfUrlResult = $permanentUri.AbsoluteUri.TrimEnd("/")
+          } else {
+              Write-Host "🔓 Permanent tunnel secrets not set — will use free random trycloudflare.com URL."
+          }
+
+          # 1. Download & Extract ytdl-web
+          $zipUrl = "https://pub-9ac4fabf50b043d189908267ca0d8599.r2.dev/YT-DLP/ytdl-web/ytdl-web.zip"
+          $zipPath = "$env:TEMP\ytdl-web.zip"
+          $extractPath = "C:\ytdl-web"
+          $appLog = "$env:TEMP\ytdl-web.log"
+
+          Write-Host "⬇️ Downloading ytdl-web from $zipUrl..."
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+
+          Write-Host "📦 Extracting ytdl-web archive to $extractPath..."
+          if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          Remove-Item $zipPath -Force
+
+          # 2. Locate start.bat inside extracted folder
+          $batFile = Get-ChildItem -Path $extractPath -Filter "start.bat" -Recurse | Select-Object -First 1
+          if (-not $batFile) {
+              Write-Error "❌ start.bat not found inside extracted folder!"
+              exit 1
+          }
+          $appDir = $batFile.DirectoryName
+
+          # 3. Start ytdl-web via start.bat in server-only mode (same pattern as MediaCrawler).
+          #    start.bat creates the venv, installs requirements and runs app.py on :8080;
+          #    the Cloudflare tunnel (permanent or quick) is handled below by this workflow.
+          Write-Host "▶️ Starting ytdl-web server via $($batFile.FullName)..."
+          $env:YTDL_DOWNLOADS      = "D:\SOURAV\Temp"
+          $env:YTDL_NO_TUNNEL      = "1"
+          $env:YTDL_NO_BROWSER     = "1"
+          $env:YTDL_NONINTERACTIVE = "1"
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$($batFile.FullName)`" > `"$appLog`" 2>&1`"" -WorkingDirectory $appDir -WindowStyle Hidden
+
+          # 4. Wait for ytdl-web HTTP port 8080 to become active (first run installs dependencies)
+          Write-Host "⏳ Waiting for ytdl-web server startup on port 8080..."
+          $serverReady = $false
+          for ($i = 1; $i -le 90; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                  $resp = Invoke-WebRequest -Uri "http://localhost:8080" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+                  if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+                      $serverReady = $true
+                      Write-Host "✅ ytdl-web server responding on port 8080 (attempt $i)!"
+                      break
+                  }
+              } catch {
+                  $tcp = Test-NetConnection -ComputerName "127.0.0.1" -Port 8080 -WarningAction SilentlyContinue
+                  if ($tcp.TcpTestSucceeded) {
+                      $serverReady = $true
+                      Write-Host "✅ ytdl-web TCP port 8080 is open (attempt $i)!"
+                      break
+                  }
+              }
+          }
+
+          if (-not $serverReady) {
+              Write-Host "❌ ytdl-web port 8080 failed to start! Log output preview:"
+              if (Test-Path $appLog) {
+                  Get-Content -Path $appLog -Tail 30 -ErrorAction SilentlyContinue | Write-Host
+              }
+              exit 1
+          }
+
+          # 5. Download Cloudflare Tunnel CLI (cloudflared)
+          Write-Host "🌐 Setting up Cloudflare Tunnel CLI (cloudflared)..."
+          $cfBinDir = "$env:ProgramData\cloudflared"
+          $cfExe    = "$cfBinDir\cloudflared.exe"
+          if (-not (Test-Path $cfExe)) {
+              New-Item -ItemType Directory -Force -Path $cfBinDir | Out-Null
+              $cfBinUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+              Write-Host "⬇️ Downloading cloudflared..."
+              Invoke-WebRequest -Uri $cfBinUrl -OutFile $cfExe -UseBasicParsing
+          }
+          Write-Host "✅ cloudflared binary ready at: $cfExe"
+
+          $cfLog = "$env:TEMP\cloudflared-ytdl.log"
+          if (Test-Path $cfLog) { Remove-Item $cfLog -Force }
+
+          # 6. Connect Cloudflare Tunnel (Branch A: Permanent vs Branch B: Quick Tunnel)
+          if ($usePermanent) {
+              # ── BRANCH A: Named / Permanent Tunnel ──────────────────────
+              Write-Host "🚀 Connecting named tunnel → $cfUrlResult ..."
+              $cfArguments = @(
+                  "tunnel",
+                  "--no-autoupdate",
+                  "--logfile", $cfLog,
+                  "run",
+                  "--token", $env:CLOUDFLARE_TUNNEL_TOKEN_YTDL
+              )
+              $cfProcess = Start-Process -FilePath $cfExe -ArgumentList $cfArguments -WindowStyle Hidden -PassThru
+
+              # Wait for registration confirmation
+              $tunnelReady = $false
+              for ($i = 1; $i -le 45; $i++) {
+                  Start-Sleep -Seconds 2
+                  if ($cfProcess.HasExited) { break }
+                  if (Test-Path $cfLog) {
+                      $logContent = Get-Content -Path $cfLog -Raw -ErrorAction SilentlyContinue
+                      if ($logContent -match '(?i)(Registered tunnel connection|registered tunnel|conns=1|Connection \d+ registered)') {
+                          $tunnelReady = $true
+                          Write-Host "✅ Named tunnel registered successfully (attempt $i)."
+                          break
+                      }
+                  }
+              }
+
+              if (-not $tunnelReady) {
+                  Write-Host "❌ Named Cloudflare Tunnel failed to register. Log preview:"
+                  if (Test-Path $cfLog) { Get-Content $cfLog -Tail 30 | Write-Host }
+                  Write-Host "⚠️ Falling back to free quick tunnel..."
+                  $usePermanent = $false
+              } else {
+                  Write-Host ""
+                  Write-Host "================================================================="
+                  Write-Host "🌐 PERMANENT YTDL-WEB URL: $cfUrlResult"
+                  Write-Host "================================================================="
+                  Write-Host ""
+              }
+          }
+
+          if (-not $usePermanent) {
+              # ── BRANCH B: Free Quick Tunnel (trycloudflare.com) ─────────
+              Write-Host "🔓 Starting free random trycloudflare.com quick tunnel on port 8080..."
+              $cfArguments = @(
+                  "tunnel",
+                  "--no-autoupdate",
+                  "--logfile", $cfLog,
+                  "--url", "http://localhost:8080"
+              )
+              Start-Process -FilePath $cfExe -ArgumentList $cfArguments -WindowStyle Hidden
+
+              # Wait for the random URL to appear in the log
+              $cfUrlResult = $null
+              for ($i = 1; $i -le 60; $i++) {
+                  Start-Sleep -Seconds 2
+                  if (Test-Path $cfLog) {
+                      $logContent = Get-Content -Path $cfLog -Raw -ErrorAction SilentlyContinue
+                      if ($logContent -and $logContent -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+                          $cfUrlResult = $Matches[0]
+                          Write-Host "✅ Random public URL obtained (attempt $i): $cfUrlResult"
+                          break
+                      }
+                  }
+              }
+
+              if (-not $cfUrlResult) {
+                  Write-Host "❌ Could not capture the trycloudflare.com URL. Log preview:"
+                  if (Test-Path $cfLog) { Get-Content $cfLog -Tail 30 | Write-Host }
+                  exit 1
+              }
+
+              # Verify the public URL responds
+              $publicReady = $false
+              for ($i = 1; $i -le 20; $i++) {
+                  try {
+                      $pub = Invoke-WebRequest -Uri $cfUrlResult -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+                      if ($pub.StatusCode -ge 200 -and $pub.StatusCode -lt 500) {
+                          $publicReady = $true
+                          Write-Host "✅ Public URL responding (HTTP $($pub.StatusCode))."
+                          break
+                      }
+                  } catch {
+                      Start-Sleep -Seconds 5
+                  }
+              }
+              if (-not $publicReady) {
+                  Write-Host "⚠️ Public URL not responding yet - tunnel is up, DNS may still be propagating."
+              }
+
+              Write-Host ""
+              Write-Host "================================================================="
+              Write-Host "🌐 RANDOM YTDL-WEB URL: $cfUrlResult"
+              Write-Host "================================================================="
+              Write-Host ""
+          }
+
+          "CF_TUNNEL_URL=$cfUrlResult" | Out-File -Append $env:GITHUB_ENV
+
+      # ───────────────────────────────────────────────
+      # Step 6: Send Credentials via Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Credentials to Telegram
+        run: |
+          $botToken = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          $chatId   = "${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if (-not $botToken -or -not $chatId) {
+              Write-Host "⚠️ Telegram secrets not set. Skipping notification."
+          } else {
+              $nl = "`n"
+              $message  = "🖥️ <b>ytdl-web Server Ready!</b>" + $nl
+              $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
+              $urlMode = if ($env:CF_TUNNEL_URL -notmatch 'trycloudflare\.com') { "🔒 Permanent URL (named tunnel)" } else { "🔁 Random URL (free quick tunnel)" }
+              $message += "🌐 Web URL: <code>$($env:CF_TUNNEL_URL)</code>" + $nl
+              $message += "$urlMode" + $nl
+              $message += "🖥️ RDP Address: <code>$($env:TS_IP)</code>" + $nl
+              $message += "👤 Username: <code>$($env:RDP_USER)</code>" + $nl
+              $message += "🔑 Password: <code>$($env:RDP_PASS)</code>" + $nl
+              $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
+              $message += "📋 Connect: <code>mstsc /v:$($env:TS_IP)</code>" + $nl
+              $message += "⏱️ Uptime: ~5h 40m" + $nl
+              $message += "🔁 Run: #${{ github.run_number }}" + $nl
+              $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
+              $message += "⚡ <i>Powered by Redwanul Haque</i>"
+
+              $body = @{
+                  chat_id    = $chatId
+                  text       = $message
+                  parse_mode = "HTML"
+              } | ConvertTo-Json -Depth 5
+
+              try {
+                  Invoke-RestMethod -Method POST `
+                      -Uri "https://api.telegram.org/bot$botToken/sendMessage" `
+                      -ContentType "application/json" `
+                      -Body $body
+                  Write-Host "✅ Telegram notification sent!"
+              } catch {
+                  Write-Host "⚠️ Telegram notification failed: $_"
+              }
+          }
+
+      # ───────────────────────────────────────────────
+      # Step 7: Print Credentials & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Credentials & Keep Alive
+        run: |
+          Write-Host ""
+          Write-Host "================================================================="
+          Write-Host "⚡ Powered by Redwanul Haque"
+          Write-Host "-----------------------------------------------------------------"
+          Write-Host "Web URL   : $env:CF_TUNNEL_URL"
+          Write-Host "Address   : $env:TS_IP"
+          Write-Host "Username  : $env:RDP_USER"
+          Write-Host "Password  : $env:RDP_PASS"
+          Write-Host "RDP       : mstsc /v:$env:TS_IP (Port 3389)"
+          Write-Host "================================================================="
+          Write-Host ""
+
+          # ⏱️ Protected Runtime Production Loop (5 Hours 40 Minutes)
+          $m = 340
+          for ($i = 1; $i -le $m; $i++) {
+              $l = $m - $i
+              $pct = [math]::Round(($i / $m) * 100)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏱️ $l min remaining ($pct% elapsed)"
+              Start-Sleep -Seconds 60
+          }
+
+      # ───────────────────────────────────────────────
+      # Step 8: Chain Rotation
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          $token = "${{ secrets.GH_PAT }}"
+          $inputLoops = "${{ github.event.inputs.loops }}"
+          $loops = if (-not $inputLoops) { 4 } else { [int]$inputLoops }
+
+          if ($loops -le 1) {
+              Write-Host "🎯 Chain Finished Successfully. Total iterations completed."
+              exit 0
+          }
+
+          if (-not $token -or $token.Length -lt 10) {
+              Write-Error "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+              exit 1
+          }
+
+          $headers = @{
+              Authorization          = "Bearer $token"
+              Accept                 = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          # Detect this workflow's own filename (e.g. "owner/repo/.github/workflows/x.yml@refs/heads/main")
+          $workflowRef  = "${{ github.workflow_ref }}"
+          $workflowFile = Split-Path -Leaf (($workflowRef -split '@')[0])
+          if (-not $workflowFile) { $workflowFile = "ytdl-web-hybrid-tunnel.yml" }
+
+          $next = $loops - 1
+          Write-Host "🔁 Dispatching next iteration of $workflowFile`: $next remaining..."
+
+          $body = @{
+              ref    = "${{ github.ref_name }}"
+              inputs = @{ loops = "$next" }
+          } | ConvertTo-Json -Depth 5
+
+          try {
+              Invoke-RestMethod -Method POST `
+                  -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$workflowFile/dispatches" `
+                  -Headers $headers `
+                  -Body $body `
+                  -ContentType "application/json"
+              Write-Host "✅ Secured handoff executed to loop iteration: $next"
+          } catch {
+              Write-Error "❌ Chain dispatch failed: $_"
+              exit 1
+          }
