@@ -1,4 +1,4 @@
-name: MediaCrawler & Cloudflare Tunnel (Windows RDP Loop) - by Redwanul Haque
+name: MediaCrawler
 # Suggested filename: mediacrawler-cloudflare-tunnel.yml
 
 on:
