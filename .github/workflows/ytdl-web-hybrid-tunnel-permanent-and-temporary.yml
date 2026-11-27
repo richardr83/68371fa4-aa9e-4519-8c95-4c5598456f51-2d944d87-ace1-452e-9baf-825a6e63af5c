@@ -1,4 +1,4 @@
-name: 🎬 ytdl-web Server • Hybrid Cloudflare Tunnel + Windows RDP (Auto-Loop) — by Redwanul Haque
+name: 🎬 ytdl-web Server
 # 📄 Suggested filename: .github/workflows/ytdl-web-hybrid-tunnel.yml
 #    (Any filename works — the chain-rotation step detects its own file automatically.)
 #
