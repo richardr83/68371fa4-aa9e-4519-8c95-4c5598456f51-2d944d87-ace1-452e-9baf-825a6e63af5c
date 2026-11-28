@@ -1,4 +1,4 @@
-name: Secure RDP via Tailscale (Automated Loop) - by Redwanul Haque
+name: Secure via Tailscale (Automated Loop) - by Redwanul Haque
 # Suggested filename: secure-windows-rdp-tailscale-v2.yml
 
 on:
